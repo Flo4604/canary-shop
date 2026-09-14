@@ -7,6 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	unkey "github.com/unkeyed/sdks/api/go/v3"
+	"github.com/unkeyed/sdks/api/go/v3/models/components"
+	"github.com/unkeyed/sdks/api/go/v3/optionalnullable"
 )
 
 const lifecycleRole = "canary-shop-catalog-reader"
@@ -16,38 +20,19 @@ type lifecycle struct {
 	poll time.Duration
 }
 
-type lifecycleProbe struct {
-	Key         string `json:"key"`
-	Permissions string `json:"permissions,omitempty"`
-	Credits     struct {
-		Cost int `json:"cost"`
-	} `json:"credits"`
-	Ratelimits []struct {
-		Name string `json:"name"`
-		Cost int    `json:"cost"`
-	} `json:"ratelimits"`
-	Tags []string `json:"tags"`
-}
-
 func (l lifecycle) expect(ctx context.Context, key apiKey, permission string, creditCost, rateCost int, want, previous string) error {
-	input := lifecycleProbe{Key: key.Plaintext, Permissions: permission, Tags: []string{"app=canary-shop", "scenario=lifecycle"}}
-	input.Credits.Cost = creditCost
-	input.Ratelimits = []struct {
-		Name string `json:"name"`
-		Cost int    `json:"cost"`
-	}{}
+	input := components.V2KeysVerifyKeyRequestBody{Key: key.Plaintext, Tags: []string{"app=canary-shop", "scenario=lifecycle"}, Credits: &components.KeysVerifyKeyCredits{Cost: int64(creditCost)}}
+	if permission != "" {
+		input.Permissions = &permission
+	}
 	if rateCost >= 0 {
-		input.Ratelimits = append(input.Ratelimits, struct {
-			Name string `json:"name"`
-			Cost int    `json:"cost"`
-		}{"lifecycle-shared", rateCost})
+		input.Ratelimits = []components.KeysVerifyKeyRatelimit{{Name: "lifecycle-shared", Cost: unkey.Int64(int64(rateCost))}}
 	}
 	for attempt := range 16 {
-		var res response[verification]
-		if err := l.c.call(ctx, "keys.verifyKey", input, &res); err != nil {
+		v, err := l.c.verify(ctx, input)
+		if err != nil {
 			return err
 		}
-		v := res.Data
 		if v.Code == want && v.Valid == (want == "VALID") && (want != "VALID" || v.KeyID == key.ID) {
 			return nil
 		}
@@ -64,24 +49,27 @@ func (l lifecycle) expect(ctx context.Context, key apiKey, permission string, cr
 }
 
 func ensureLifecycleRole(ctx context.Context, c *apiClient) error {
-	var res response[struct {
-		Name        string `json:"name"`
-		Permissions []struct {
-			Slug string `json:"slug"`
-		} `json:"permissions"`
-	}]
-	err := c.call(ctx, "permissions.getRole", map[string]string{"role": lifecycleRole}, &res)
+	res, sdkErr := c.Permissions.GetRole(ctx, components.V2PermissionsGetRoleRequestBody{Role: lifecycleRole})
+	err := sdkError(ctx, "permissions.getRole", sdkErr)
 	var remote *apiError
 	if errors.As(err, &remote) && remote.status == 404 {
-		return c.call(ctx, "permissions.createRole", struct {
-			Name        string   `json:"name"`
-			Permissions []string `json:"permissions"`
-		}{lifecycleRole, []string{"catalog.read"}}, nil)
+		created, err := c.Permissions.CreateRole(ctx, components.V2PermissionsCreateRoleRequestBody{Name: lifecycleRole, Permissions: []string{"catalog.read"}})
+		if err != nil {
+			return sdkError(ctx, "permissions.createRole", err)
+		}
+		if created == nil || created.V2PermissionsCreateRoleResponseBody == nil || created.V2PermissionsCreateRoleResponseBody.Data.RoleID == "" {
+			return errors.New("create role returned no ID")
+		}
+		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if res.Data.Name != lifecycleRole || len(res.Data.Permissions) != 1 || res.Data.Permissions[0].Slug != "catalog.read" {
+	if res == nil || res.V2PermissionsGetRoleResponseBody == nil {
+		return errors.New("missing role response")
+	}
+	data := res.V2PermissionsGetRoleResponseBody.Data
+	if data.Name != lifecycleRole || len(data.Permissions) != 1 || data.Permissions[0].Slug != "catalog.read" {
 		return errors.New("existing lifecycle role differs; refusing to overwrite")
 	}
 	return nil
@@ -104,38 +92,40 @@ func runLifecycle(ctx context.Context, c *apiClient, apiID string, poll time.Dur
 			result = errors.Join(result, deleteFixture(cleanup, c, key.ID))
 		}
 		if identityCreated {
-			result = errors.Join(result, c.call(cleanup, "identities.deleteIdentity", map[string]string{"identity": identity}, nil))
+			res, err := c.Identities.DeleteIdentity(cleanup, components.V2IdentitiesDeleteIdentityRequestBody{Identity: identity})
+			result = errors.Join(result, sdkError(cleanup, "identities.deleteIdentity", err))
+			if err == nil && (res == nil || res.V2IdentitiesDeleteIdentityResponseBody == nil || res.V2IdentitiesDeleteIdentityResponseBody.Meta.RequestID == "") {
+				result = errors.Join(result, errors.New("missing identity deletion metadata"))
+			}
 		}
 	}()
-	if err := c.call(ctx, "identities.createIdentity", struct {
-		ExternalID string          `json:"externalId"`
-		Ratelimits []identityLimit `json:"ratelimits"`
-	}{identity, []identityLimit{{Name: "lifecycle-shared", Limit: 2, Duration: 3600000, AutoApply: true}}}, nil); err != nil {
-		return err
+	createdIdentity, err := c.Identities.CreateIdentity(ctx, components.V2IdentitiesCreateIdentityRequestBody{ExternalID: identity,
+		Ratelimits: []components.RatelimitRequest{{Name: "lifecycle-shared", Limit: 2, Duration: 3600000, AutoApply: unkey.Bool(true)}}})
+	if err != nil {
+		return sdkError(ctx, "identities.createIdentity", err)
+	}
+	if createdIdentity == nil || createdIdentity.V2IdentitiesCreateIdentityResponseBody == nil || createdIdentity.V2IdentitiesCreateIdentityResponseBody.Data.IdentityID == "" {
+		return errors.New("create identity returned no ID")
 	}
 	identityCreated = true
 	for _, name := range []string{"role", "grant", "credits", "revoke", "shared-a", "shared-b"} {
-		input := createKey{APIID: apiID, Name: "canary-shop-lifecycle-" + name, Prefix: "canary", Enabled: true,
-			Meta: keyMeta{Owner: owner, Scenario: "lifecycle-" + name}, Expires: time.Now().Add(time.Hour).UnixMilli(), Permissions: []string{}}
+		input := components.V2KeysCreateKeyRequestBody{APIID: apiID, Name: unkey.String("canary-shop-lifecycle-" + name), Prefix: unkey.String("canary"), Enabled: unkey.Bool(true), Recoverable: unkey.Bool(false),
+			Meta: (keyMeta{Owner: owner, Scenario: "lifecycle-" + name}).sdkMeta(), Expires: unkey.Int64(time.Now().Add(time.Hour).UnixMilli()), Permissions: []string{}}
 		if name == "shared-a" || name == "shared-b" {
-			input.ExternalID = identity
+			input.ExternalID = &identity
 		}
 		if name == "credits" {
-			input.Credits = &struct {
-				Remaining int `json:"remaining"`
-			}{2}
+			input.Credits = &components.KeyCreditsData{Remaining: unkey.Int64(2)}
 		}
-		var res response[struct {
-			ID  string `json:"keyId"`
-			Key string `json:"key"`
-		}]
-		if err := c.call(ctx, "keys.createKey", input, &res); err != nil {
-			return err
+		res, err := c.Keys.CreateKey(ctx, input)
+		if err != nil {
+			return sdkError(ctx, "keys.createKey", err)
 		}
-		if res.Data.ID == "" || res.Data.Key == "" {
+		if res == nil || res.V2KeysCreateKeyResponseBody == nil || res.V2KeysCreateKeyResponseBody.Data.KeyID == "" || res.V2KeysCreateKeyResponseBody.Data.Key == "" {
 			return errors.New("lifecycle create returned no credential")
 		}
-		key := apiKey{ID: res.Data.ID, Plaintext: res.Data.Key, Name: name}
+		data := res.V2KeysCreateKeyResponseBody.Data
+		key := apiKey{ID: data.KeyID, Plaintext: data.Key, Name: name}
 		keys[name] = key
 		rateCost := -1
 		if name == "shared-a" || name == "shared-b" {
@@ -150,12 +140,22 @@ func runLifecycle(ctx context.Context, c *apiClient, apiID string, poll time.Dur
 		if err := l.expect(ctx, key, "catalog.read", 0, -1, "INSUFFICIENT_PERMISSIONS", ""); err != nil {
 			return err
 		}
-		operation, field, value := "keys.addRoles", "roles", lifecycleRole
 		if name == "grant" {
-			operation, field, value = "keys.addPermissions", "permissions", "catalog.read"
-		}
-		if err := c.call(ctx, operation, map[string]any{"keyId": key.ID, field: []string{value}}, nil); err != nil {
-			return err
+			res, err := c.Keys.AddPermissions(ctx, components.V2KeysAddPermissionsRequestBody{KeyID: key.ID, Permissions: []string{"catalog.read"}})
+			if err != nil {
+				return sdkError(ctx, "keys.addPermissions", err)
+			}
+			if res == nil || res.V2KeysAddPermissionsResponseBody == nil || res.V2KeysAddPermissionsResponseBody.Data == nil {
+				return errors.New("missing permission grant response")
+			}
+		} else {
+			res, err := c.Keys.AddRoles(ctx, components.V2KeysAddRolesRequestBody{KeyID: key.ID, Roles: []string{lifecycleRole}})
+			if err != nil {
+				return sdkError(ctx, "keys.addRoles", err)
+			}
+			if res == nil || res.V2KeysAddRolesResponseBody == nil || res.V2KeysAddRolesResponseBody.Data == nil {
+				return errors.New("missing role grant response")
+			}
 		}
 		if err := l.expect(ctx, key, "catalog.read", 0, -1, "VALID", "INSUFFICIENT_PERMISSIONS"); err != nil {
 			return err
@@ -172,8 +172,12 @@ func runLifecycle(ctx context.Context, c *apiClient, apiID string, poll time.Dur
 	if err := l.expect(ctx, keys["credits"], "", 1, -1, "USAGE_EXCEEDED", ""); err != nil {
 		return err
 	}
-	if err := c.call(ctx, "keys.updateCredits", map[string]any{"keyId": keys["credits"].ID, "operation": "increment", "value": 1}, nil); err != nil {
-		return err
+	refill, err := c.Keys.UpdateCredits(ctx, components.V2KeysUpdateCreditsRequestBody{KeyID: keys["credits"].ID, Operation: components.OperationIncrement, Value: optionalnullable.From(unkey.Int64(1))})
+	if err != nil {
+		return sdkError(ctx, "keys.updateCredits", err)
+	}
+	if refill == nil || refill.V2KeysUpdateCreditsResponseBody == nil || refill.V2KeysUpdateCreditsResponseBody.Data.Remaining == nil {
+		return errors.New("missing refill response")
 	}
 	if err := l.expect(ctx, keys["credits"], "", 1, -1, "VALID", "USAGE_EXCEEDED"); err != nil {
 		return err

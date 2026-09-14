@@ -68,25 +68,29 @@ func TestLifecycleTransitions(t *testing.T) {
 					if body.Role != lifecycleRole {
 						t.Error("wrong role lookup")
 					}
-					http.Error(w, "missing", 404)
+					writeAPIError(w, 404)
 					return
 				case "permissions.createRole":
 					if body.Name != lifecycleRole || string(body.Permissions) != `["catalog.read"]` {
 						t.Error("wrong role definition")
 					}
 					roleCreated = true
+					data = map[string]string{"roleId": "role_catalog"}
 				case "identities.createIdentity":
 					identity = body.ExternalID
 					if !strings.HasPrefix(identity, "canary-shop-lifecycle-") || len(body.Ratelimits) != 1 || body.Ratelimits[0].Limit != 2 || body.Ratelimits[0].Duration != 3600000 || !body.Ratelimits[0].AutoApply {
 						t.Error("wrong isolated identity limit")
 					}
+					data = map[string]string{"identityId": "id_isolated"}
 				case "identities.deleteIdentity":
 					if body.Identity != identity {
 						t.Error("deleted unrelated identity")
 					}
 					identityDeleted = true
+					writeJSON(w, 200, map[string]any{"meta": map[string]string{"requestId": "req_delete_identity"}})
+					return
 				case "keys.createKey":
-					if body.APIID != "api_isolated" || string(body.Permissions) != "[]" || body.Recoverable || body.Expires <= time.Now().UnixMilli() || body.Expires > time.Now().Add(time.Hour).UnixMilli() {
+					if body.APIID != "api_isolated" || (len(body.Permissions) != 0 && string(body.Permissions) != "[]") || body.Recoverable || body.Expires <= time.Now().UnixMilli() || body.Expires > time.Now().Add(time.Hour).UnixMilli() {
 						t.Error("unsafe lifecycle fixture")
 					}
 					name := strings.TrimPrefix(body.Name, "canary-shop-lifecycle-")
@@ -105,12 +109,14 @@ func TestLifecycleTransitions(t *testing.T) {
 					}
 					keys[body.KeyID].granted = defect != "role"
 					grants++
+					data = []map[string]string{{"id": "role_catalog", "name": lifecycleRole}}
 				case "keys.addPermissions":
 					if string(body.Permissions) != `["catalog.read"]` {
 						t.Error("wrong permission grant")
 					}
 					keys[body.KeyID].granted = defect != "grant"
 					grants++
+					data = []map[string]string{{"id": "perm_catalog", "name": "catalog.read", "slug": "catalog.read"}}
 				case "keys.updateCredits":
 					if body.Operation != "increment" || body.Value != 1 {
 						t.Error("wrong refill")
@@ -119,6 +125,7 @@ func TestLifecycleTransitions(t *testing.T) {
 						keys[body.KeyID].remaining += body.Value
 					}
 					refills++
+					data = map[string]int{"remaining": keys[body.KeyID].remaining}
 				case "keys.deleteKey":
 					if defect != "no-revoke" {
 						keys[body.KeyID].deleted = true
@@ -165,10 +172,10 @@ func TestLifecycleTransitions(t *testing.T) {
 					http.Error(w, "endpoint", 404)
 					return
 				}
-				writeJSON(w, 200, map[string]any{"data": data})
+				writeAPIData(w, data)
 			}))
 			t.Cleanup(server.Close)
-			err := runLifecycle(context.Background(), &apiClient{baseURL: server.URL, rootKey: testRoot, http: newHTTPClient()}, "api_isolated", 0)
+			err := runLifecycle(context.Background(), newAPIClient(server.URL, testRoot), "api_isolated", 0)
 			if (err != nil) != (defect != "") {
 				t.Fatalf("defect=%q: got %v", defect, err)
 			}
@@ -209,10 +216,10 @@ func TestLifecyclePropagation(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				code := tc.codes[min(calls, len(tc.codes)-1)]
 				calls++
-				writeJSON(w, 200, response[verification]{verification{KeyID: "key_test", Code: code, Valid: code == "VALID"}})
+				writeAPIData(w, verification{KeyID: "key_test", Code: code, Valid: code == "VALID"})
 			}))
 			t.Cleanup(server.Close)
-			l := lifecycle{c: &apiClient{baseURL: server.URL, http: newHTTPClient()}}
+			l := lifecycle{c: newAPIClient(server.URL, "test")}
 			err := l.expect(context.Background(), apiKey{ID: "key_test"}, "", 0, -1, tc.want, tc.previous)
 			if (err != nil) != tc.fail {
 				t.Fatalf("got %v", err)

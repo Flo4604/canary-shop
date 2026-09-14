@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	unkey "github.com/unkeyed/sdks/api/go/v3"
+	"github.com/unkeyed/sdks/api/go/v3/models/components"
 )
 
 const owner = "canary-shop"
@@ -38,16 +41,14 @@ func fixtures() []fixture {
 
 func initAPIs(ctx context.Context, c *apiClient, out io.Writer) error {
 	for _, name := range []string{"STOREFRONT", "WAREHOUSE"} {
-		var res response[struct {
-			ID string `json:"apiId"`
-		}]
-		if err := c.call(ctx, "apis.createApi", map[string]string{"name": "canary-shop-" + name}, &res); err != nil {
-			return err
+		res, err := c.Apis.CreateAPI(ctx, components.V2ApisCreateAPIRequestBody{Name: "canary-shop-" + name})
+		if err != nil {
+			return sdkError(ctx, "apis.createApi", err)
 		}
-		if res.Data.ID == "" {
+		if res == nil || res.V2ApisCreateAPIResponseBody == nil || res.V2ApisCreateAPIResponseBody.Data.APIID == "" {
 			return errors.New("API create returned no ID; inspect dashboard before running init again")
 		}
-		if _, err := fmt.Fprintf(out, "%s_API_ID=%s\n", name, res.Data.ID); err != nil {
+		if _, err := fmt.Fprintf(out, "%s_API_ID=%s\n", name, res.V2ApisCreateAPIResponseBody.Data.APIID); err != nil {
 			return err
 		}
 	}
@@ -57,45 +58,54 @@ func initAPIs(ctx context.Context, c *apiClient, out io.Writer) error {
 func setup(ctx context.Context, c *apiClient) error {
 	for i := range 30 {
 		f := fixtures()[i*2]
-		var identity response[struct {
-			ExternalID string  `json:"externalId"`
-			Meta       keyMeta `json:"meta"`
-		}]
-		err := c.call(ctx, "identities.getIdentity", map[string]string{"identity": f.Meta.Customer}, &identity)
+		identity, sdkErr := c.Identities.GetIdentity(ctx, components.V2IdentitiesGetIdentityRequestBody{Identity: f.Meta.Customer})
+		err := sdkError(ctx, "identities.getIdentity", sdkErr)
 		var remote *apiError
 		if errors.As(err, &remote) && remote.status == 404 {
-			input := struct {
-				ExternalID string          `json:"externalId"`
-				Meta       keyMeta         `json:"meta"`
-				Ratelimits []identityLimit `json:"ratelimits"`
-			}{f.Meta.Customer, f.Meta, []identityLimit{{Name: "customer", Limit: planLimit(f.Meta.Plan) * 4, Duration: 60000, AutoApply: true}}}
-			if err := c.call(ctx, "identities.createIdentity", input, nil); err != nil {
-				return err
+			res, err := c.Identities.CreateIdentity(ctx, components.V2IdentitiesCreateIdentityRequestBody{
+				ExternalID: f.Meta.Customer, Meta: f.Meta.sdkMeta(),
+				Ratelimits: []components.RatelimitRequest{{Name: "customer", Limit: int64(planLimit(f.Meta.Plan) * 4), Duration: 60000, AutoApply: unkey.Bool(true)}},
+			})
+			if err != nil {
+				return sdkError(ctx, "identities.createIdentity", err)
+			}
+			if res == nil || res.V2IdentitiesCreateIdentityResponseBody == nil || res.V2IdentitiesCreateIdentityResponseBody.Data.IdentityID == "" {
+				return errors.New("create identity returned no ID")
 			}
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		if identity.Data.ExternalID != f.Meta.Customer || identity.Data.Meta != f.Meta {
+		if identity == nil || identity.V2IdentitiesGetIdentityResponseBody == nil {
+			return errors.New("missing identity response")
+		}
+		data := identity.V2IdentitiesGetIdentityResponseBody.Data
+		meta, err := parseMeta(data.Meta)
+		if err != nil {
+			return err
+		}
+		if data.ExternalID != f.Meta.Customer || meta != f.Meta {
 			return errors.New("existing demo identity differs; refusing to overwrite")
 		}
 	}
 	for _, ns := range append(append([]string{}, namespaces...), budgetNamespace) {
-		if err := c.call(ctx, "ratelimit.limit", limitRequest{Namespace: ns, Identifier: "canary-shop-setup", Limit: 1, Duration: 60000, Cost: 0}, nil); err != nil {
-			return err
+		limited, err := c.Ratelimit.Limit(ctx, components.V2RatelimitLimitRequestBody{Namespace: ns, Identifier: "canary-shop-setup", Limit: 1, Duration: 60000, Cost: unkey.Int64(0)})
+		if err != nil {
+			return sdkError(ctx, "ratelimit.limit", err)
+		}
+		if limited == nil || limited.V2RatelimitLimitResponseBody == nil || !limited.V2RatelimitLimitResponseBody.Data.Success {
+			return errors.New("namespace setup denied")
 		}
 		if ns == budgetNamespace {
 			continue
 		}
-		input := struct {
-			Namespace  string `json:"namespace"`
-			Identifier string `json:"identifier"`
-			Limit      int    `json:"limit"`
-			Duration   int    `json:"duration"`
-		}{ns, "canary-shop-customer-02", 120, 60000}
-		if err := c.call(ctx, "ratelimit.setOverride", input, nil); err != nil {
-			return err
+		res, err := c.Ratelimit.SetOverride(ctx, components.V2RatelimitSetOverrideRequestBody{Namespace: ns, Identifier: "canary-shop-customer-02", Limit: 120, Duration: 60000})
+		if err != nil {
+			return sdkError(ctx, "ratelimit.setOverride", err)
+		}
+		if res == nil || res.V2RatelimitSetOverrideResponseBody == nil || res.V2RatelimitSetOverrideResponseBody.Data.OverrideID == "" {
+			return errors.New("missing override response")
 		}
 	}
 	return nil
@@ -121,30 +131,26 @@ func createFixtures(ctx context.Context, c *apiClient, apis map[string]string, n
 	}
 	created := map[string]apiKey{}
 	for _, f := range fixtures() {
-		input := createKey{APIID: apis[f.API], Name: f.Name, Prefix: "canary", ExternalID: f.Meta.Customer, Meta: f.Meta,
-			Enabled: f.Meta.Scenario != "disabled", Expires: now.Add(24 * time.Hour).UnixMilli(),
+		input := components.V2KeysCreateKeyRequestBody{APIID: apis[f.API], Name: &f.Name, Prefix: unkey.String("canary"), ExternalID: &f.Meta.Customer, Meta: f.Meta.sdkMeta(),
+			Enabled: unkey.Bool(f.Meta.Scenario != "disabled"), Recoverable: unkey.Bool(false), Expires: unkey.Int64(now.Add(24 * time.Hour).UnixMilli()),
 			Permissions: []string{"catalog.read", "orders.write", "exports.read"}}
 		switch f.Meta.Scenario {
 		case "expired":
-			input.Expires = now.Add(-time.Minute).UnixMilli()
+			input.Expires = unkey.Int64(now.Add(-time.Minute).UnixMilli())
 		case "exhausted":
-			input.Credits = &struct {
-				Remaining int `json:"remaining"`
-			}{0}
+			input.Credits = &components.KeyCreditsData{Remaining: unkey.Int64(0)}
 		case "readonly":
 			input.Permissions = []string{"catalog.read"}
 		}
-		var res response[struct {
-			ID  string `json:"keyId"`
-			Key string `json:"key"`
-		}]
-		if err := c.call(ctx, "keys.createKey", input, &res); err != nil {
-			return nil, err
+		res, err := c.Keys.CreateKey(ctx, input)
+		if err != nil {
+			return nil, sdkError(ctx, "keys.createKey", err)
 		}
-		if res.Data.ID == "" || res.Data.Key == "" {
+		if res == nil || res.V2KeysCreateKeyResponseBody == nil || res.V2KeysCreateKeyResponseBody.Data.KeyID == "" || res.V2KeysCreateKeyResponseBody.Data.Key == "" {
 			return nil, errors.New("create key returned no credential")
 		}
-		created[f.Name] = apiKey{ID: res.Data.ID, Name: f.Name, Plaintext: res.Data.Key, Meta: f.Meta, Expires: input.Expires}
+		data := res.V2KeysCreateKeyResponseBody.Data
+		created[f.Name] = apiKey{ID: data.KeyID, Name: f.Name, Plaintext: data.Key, Meta: f.Meta, Expires: deref(input.Expires)}
 	}
 	return created, nil
 }
@@ -153,13 +159,14 @@ func deleteFixture(ctx context.Context, c *apiClient, id string) error {
 	if id == "" {
 		return errors.New("missing fixture key ID")
 	}
-	err := c.call(ctx, "keys.deleteKey", struct {
-		ID        string `json:"keyId"`
-		Permanent bool   `json:"permanent"`
-	}{id, false}, nil)
+	res, sdkErr := c.Keys.DeleteKey(ctx, components.V2KeysDeleteKeyRequestBody{KeyID: id, Permanent: unkey.Bool(false)})
+	err := sdkError(ctx, "keys.deleteKey", sdkErr)
 	var remote *apiError
 	if errors.As(err, &remote) && remote.status == 404 {
 		return nil
+	}
+	if err == nil && (res == nil || res.V2KeysDeleteKeyResponseBody == nil || res.V2KeysDeleteKeyResponseBody.Meta.RequestID == "") {
+		return errors.New("missing delete key response")
 	}
 	return err
 }
@@ -170,28 +177,6 @@ func retireFixtures(ctx context.Context, c *apiClient, keys map[string]apiKey) {
 			slog.Warn("could not retire demo key; expiry still applies", "key_id", key.ID, "error", err)
 		}
 	}
-}
-
-type identityLimit struct {
-	Name      string `json:"name"`
-	Limit     int    `json:"limit"`
-	Duration  int    `json:"duration"`
-	AutoApply bool   `json:"autoApply"`
-}
-
-type createKey struct {
-	APIID       string   `json:"apiId"`
-	Name        string   `json:"name"`
-	Prefix      string   `json:"prefix"`
-	ExternalID  string   `json:"externalId,omitempty"`
-	Meta        keyMeta  `json:"meta"`
-	Enabled     bool     `json:"enabled"`
-	Recoverable bool     `json:"recoverable"`
-	Permissions []string `json:"permissions"`
-	Expires     int64    `json:"expires"`
-	Credits     *struct {
-		Remaining int `json:"remaining"`
-	} `json:"credits,omitempty"`
 }
 
 func planLimit(plan string) int {

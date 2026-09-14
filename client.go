@@ -12,12 +12,24 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	unkey "github.com/unkeyed/sdks/api/go/v3"
+	"github.com/unkeyed/sdks/api/go/v3/models/apierrors"
+	"github.com/unkeyed/sdks/api/go/v3/models/components"
+	"github.com/unkeyed/sdks/api/go/v3/retry"
 )
 
 type apiClient struct {
-	baseURL string
-	rootKey string
-	http    *http.Client
+	*unkey.Unkey
+}
+
+func newAPIClient(baseURL, rootKey string) *apiClient {
+	return &apiClient{unkey.New(
+		unkey.WithServerURL(baseURL),
+		unkey.WithSecurity(rootKey),
+		unkey.WithClient(requiredFieldsClient{newHTTPClient()}),
+		unkey.WithRetryConfig(retry.Config{Strategy: "none"}),
+	)}
 }
 
 type apiError struct {
@@ -61,48 +73,90 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-func (c *apiClient) call(ctx context.Context, operation string, input, output any) error {
-	body, err := json.Marshal(input)
-	if err != nil {
-		return fmt.Errorf("encode %s: %w", operation, err)
+type requiredFieldsClient struct{ client *http.Client }
+
+func (c requiredFieldsClient) Do(req *http.Request) (*http.Response, error) {
+	res, err := c.client.Do(req)
+	if err != nil || res.StatusCode != http.StatusOK {
+		return res, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v2/"+operation, bytes.NewReader(body))
-	if err != nil {
-		return errors.New("construct Unkey request")
+	if req.URL.Path != "/v2/keys.verifyKey" && req.URL.Path != "/v2/ratelimit.limit" && req.URL.Path != "/v2/apis.listKeys" {
+		return res, nil
 	}
-	req.Header.Set("Authorization", "Bearer "+c.rootKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "canary-shop/1")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, (2<<20)+1))
+	closeErr := res.Body.Close()
+	if readErr != nil || closeErr != nil || len(body) > 2<<20 {
+		return nil, errors.New("invalid Unkey response")
+	}
+	var envelope struct {
+		Data       json.RawMessage `json:"data"`
+		Pagination *struct {
+			HasMore *bool `json:"hasMore"`
+		} `json:"pagination"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, errors.New("invalid Unkey response")
+	}
+	var fields struct {
+		Valid   *bool `json:"valid"`
+		Success *bool `json:"success"`
+	}
+	if req.URL.Path == "/v2/apis.listKeys" {
+		if envelope.Pagination == nil || envelope.Pagination.HasMore == nil {
+			return nil, errors.New("missing key pagination")
 		}
-		return fmt.Errorf("Unkey %s transport failure (not retried)", operation)
+	} else {
+		if err := json.Unmarshal(envelope.Data, &fields); err != nil {
+			return nil, errors.New("invalid Unkey response")
+		}
+		if (req.URL.Path == "/v2/keys.verifyKey" && fields.Valid == nil) || (req.URL.Path == "/v2/ratelimit.limit" && fields.Success == nil) {
+			return nil, errors.New("missing Unkey decision")
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return &apiError{status: resp.StatusCode, operation: operation}
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return fmt.Errorf("read %s response", operation)
-	}
-	var envelope response[json.RawMessage]
-	if err := json.Unmarshal(data, &envelope); err != nil || len(envelope.Data) == 0 || bytes.Equal(envelope.Data, []byte("null")) {
-		return fmt.Errorf("invalid %s response envelope", operation)
-	}
-	if output == nil {
-		return nil
-	}
-	if err := json.Unmarshal(data, output); err != nil {
-		return fmt.Errorf("invalid %s response", operation)
-	}
-	return nil
+	res.Body = io.NopCloser(bytes.NewReader(body))
+	return res, nil
 }
 
-type response[T any] struct {
-	Data T `json:"data"`
+func sdkError(ctx context.Context, operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	status := 0
+	var generic *apierrors.APIError
+	if errors.As(err, &generic) {
+		status = generic.StatusCode
+	}
+	switch err.(type) {
+	case *apierrors.BadRequestErrorResponse:
+		status = 400
+	case *apierrors.UnauthorizedErrorResponse:
+		status = 401
+	case *apierrors.ForbiddenErrorResponse:
+		status = 403
+	case *apierrors.NotFoundErrorResponse:
+		status = 404
+	case *apierrors.ConflictErrorResponse:
+		status = 409
+	case *apierrors.GoneErrorResponse:
+		status = 410
+	case *apierrors.PreconditionFailedErrorResponse:
+		status = 412
+	case *apierrors.UnprocessableEntityErrorResponse:
+		status = 422
+	case *apierrors.TooManyRequestsErrorResponse:
+		status = 429
+	case *apierrors.InternalServerErrorResponse:
+		status = 500
+	case *apierrors.ServiceUnavailableErrorResponse:
+		status = 503
+	}
+	if status != 0 {
+		return &apiError{status: status, operation: operation}
+	}
+	return fmt.Errorf("Unkey %s failed (not retried)", operation)
 }
 
 type keyMeta struct {
@@ -110,6 +164,26 @@ type keyMeta struct {
 	Customer string `json:"customer"`
 	Plan     string `json:"plan"`
 	Scenario string `json:"scenario"`
+}
+
+func (m keyMeta) sdkMeta() map[string]any {
+	return map[string]any{"owner": m.Owner, "customer": m.Customer, "plan": m.Plan, "scenario": m.Scenario}
+}
+
+func parseMeta(input map[string]any) (keyMeta, error) {
+	var meta keyMeta
+	for name, dest := range map[string]*string{"owner": &meta.Owner, "customer": &meta.Customer, "plan": &meta.Plan, "scenario": &meta.Scenario} {
+		value, exists := input[name]
+		if !exists {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok {
+			return keyMeta{}, errors.New("invalid demo metadata")
+		}
+		*dest = text
+	}
+	return meta, nil
 }
 
 type apiKey struct {
@@ -125,33 +199,61 @@ func (c *apiClient) listKeys(ctx context.Context, apiID string, decrypt bool) ([
 	cursor := ""
 	seen := map[string]bool{}
 	for {
-		var res struct {
-			Data       []apiKey `json:"data"`
-			Pagination *struct {
-				HasMore bool   `json:"hasMore"`
-				Cursor  string `json:"cursor"`
-			} `json:"pagination"`
+		input := components.V2ApisListKeysRequestBody{APIID: apiID, Limit: unkey.Int64(100), Decrypt: &decrypt}
+		if cursor != "" {
+			input.Cursor = &cursor
 		}
-		err := c.call(ctx, "apis.listKeys", struct {
-			APIID   string `json:"apiId"`
-			Limit   int    `json:"limit"`
-			Decrypt bool   `json:"decrypt"`
-			Cursor  string `json:"cursor,omitempty"`
-		}{apiID, 100, decrypt, cursor}, &res)
+		res, err := c.Apis.ListKeys(ctx, input)
 		if err != nil {
-			return nil, err
+			return nil, sdkError(ctx, "apis.listKeys", err)
 		}
-		if res.Data == nil || res.Pagination == nil {
+		if res == nil || res.V2ApisListKeysResponseBody == nil || res.V2ApisListKeysResponseBody.Data == nil {
 			return nil, errors.New("incomplete key listing response")
 		}
-		keys = append(keys, res.Data...)
-		if !res.Pagination.HasMore {
+		body := res.V2ApisListKeysResponseBody
+		for _, key := range body.Data {
+			meta, err := parseMeta(key.Meta)
+			if err != nil {
+				return nil, err
+			}
+			if key.KeyID == "" {
+				return nil, errors.New("key listing missing ID")
+			}
+			keys = append(keys, apiKey{ID: key.KeyID, Name: deref(key.Name), Meta: meta, Expires: deref(key.Expires)})
+		}
+		if !body.Pagination.HasMore {
 			return keys, nil
 		}
-		cursor = res.Pagination.Cursor
+		cursor = deref(body.Pagination.Cursor)
 		if cursor == "" || seen[cursor] {
 			return nil, errors.New("invalid key pagination cursor")
 		}
 		seen[cursor] = true
 	}
+}
+
+func deref[T any](p *T) (value T) {
+	if p != nil {
+		return *p
+	}
+	return value
+}
+
+func (c *apiClient) verify(ctx context.Context, input components.V2KeysVerifyKeyRequestBody) (verification, error) {
+	res, err := c.Keys.VerifyKey(ctx, input)
+	if err != nil {
+		return verification{}, sdkError(ctx, "keys.verifyKey", err)
+	}
+	if res == nil || res.V2KeysVerifyKeyResponseBody == nil {
+		return verification{}, errors.New("missing verification response")
+	}
+	data := res.V2KeysVerifyKeyResponseBody.Data
+	if !data.Code.IsExact() || data.Valid != (data.Code == components.CodeValid) {
+		return verification{}, errors.New("unknown or inconsistent verification result")
+	}
+	meta, err := parseMeta(data.Meta)
+	if err != nil {
+		return verification{}, err
+	}
+	return verification{Valid: data.Valid, Code: string(data.Code), KeyID: deref(data.KeyID), Meta: meta}, nil
 }

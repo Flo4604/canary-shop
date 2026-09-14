@@ -10,17 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	unkey "github.com/unkeyed/sdks/api/go/v3"
+	"github.com/unkeyed/sdks/api/go/v3/models/components"
 )
 
 var buildVersion = "development"
-
-type limitRequest struct {
-	Namespace  string `json:"namespace"`
-	Identifier string `json:"identifier"`
-	Limit      int    `json:"limit"`
-	Duration   int    `json:"duration"`
-	Cost       int    `json:"cost"`
-}
 
 type verification struct {
 	Valid bool    `json:"valid"`
@@ -94,17 +89,11 @@ func shopHandler(c *apiClient, token string, dailyLimit int) http.Handler {
 				upstreamFailure(w, err)
 				return
 			}
-			var verified response[verification]
-			err := c.call(r.Context(), "keys.verifyKey", struct {
-				Key         string   `json:"key"`
-				Permissions string   `json:"permissions"`
-				Tags        []string `json:"tags"`
-			}{key, route.permission, []string{"app=canary-shop", "route=" + r.URL.Path}}, &verified)
+			v, err := c.verify(r.Context(), components.V2KeysVerifyKeyRequestBody{Key: key, Permissions: &route.permission, Tags: []string{"app=canary-shop", "route=" + r.URL.Path}})
 			if err != nil {
 				upstreamFailure(w, err)
 				return
 			}
-			v := verified.Data
 			if !v.Valid {
 				status := denialStatus(v.Code)
 				if status == 502 {
@@ -119,20 +108,17 @@ func shopHandler(c *apiClient, token string, dailyLimit int) http.Handler {
 				reply(w, 403, shopResult{Code: "NOT_DEMO_KEY"})
 				return
 			}
-			var limited response[struct {
-				Success *bool `json:"success"`
-			}]
-			err = c.call(r.Context(), "ratelimit.limit", limitRequest{Namespace: route.namespace, Identifier: v.Meta.Customer,
-				Limit: planLimit(v.Meta.Plan), Duration: 60000, Cost: 1}, &limited)
+			limited, err := c.Ratelimit.Limit(r.Context(), components.V2RatelimitLimitRequestBody{Namespace: route.namespace, Identifier: v.Meta.Customer,
+				Limit: int64(planLimit(v.Meta.Plan)), Duration: 60000, Cost: unkey.Int64(1)})
 			if err != nil {
-				upstreamFailure(w, err)
+				upstreamFailure(w, sdkError(r.Context(), "ratelimit.limit", err))
 				return
 			}
-			if limited.Data.Success == nil {
+			if limited == nil || limited.V2RatelimitLimitResponseBody == nil {
 				upstreamFailure(w, errors.New("rate limit response missing success"))
 				return
 			}
-			if !*limited.Data.Success {
+			if !limited.V2RatelimitLimitResponseBody.Data.Success {
 				reply(w, 429, shopResult{Code: "RATE_LIMITED"})
 				slog.Info("request denied", "route", r.URL.Path, "code", "RATE_LIMITED", "customer", v.Meta.Customer)
 				return

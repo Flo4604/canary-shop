@@ -4,6 +4,15 @@ A synthetic commerce API and continuous traffic worker for a shared Unkey
 canary workspace. Uses public Unkey APIs only. No database connection,
 persistent disk, key recovery feature, or app frontend.
 
+All application Unkey calls use the official Go SDK,
+`github.com/unkeyed/sdks/api/go/v3` pinned to `v3.0.0`. SDK retries are disabled,
+redirects are refused, and logged errors omit response bodies and credentials.
+The SDK models required booleans as plain Go `bool`, so a small HTTP response
+guard rejects missing or null verification, rate-limit, and pagination
+decisions before SDK decoding. The SDK handles endpoint requests, response
+types, and statuses, including metadata-only identity deletion. Application
+checks still reject unknown verification codes and invalid demo metadata.
+
 The Unkey dashboard is the interface this app exercises.
 
 ## What runs

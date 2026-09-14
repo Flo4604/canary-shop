@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unkeyed/sdks/api/go/v3/models/components"
 )
 
 func TestSafeURL(t *testing.T) {
@@ -37,9 +40,9 @@ func TestClientDoesNotFollowRedirectsOrRetry(t *testing.T) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	c := &apiClient{baseURL: server.URL, rootKey: "do-not-forward", http: newHTTPClient()}
+	c := newAPIClient(server.URL, "do-not-forward")
 	var remote *apiError
-	if err := c.call(context.Background(), "keys.verifyKey", map[string]string{"key": "demo"}, nil); !errors.As(err, &remote) || remote.status != 307 {
+	if _, err := c.verify(context.Background(), components.V2KeysVerifyKeyRequestBody{Key: "demo"}); !errors.As(err, &remote) || remote.status != 307 {
 		t.Fatalf("redirect: %v", err)
 	}
 	if forwarded != 0 || attempts != 1 {
@@ -50,9 +53,12 @@ func TestClientDoesNotFollowRedirectsOrRetry(t *testing.T) {
 func TestListKeysRejectsMalformedOrRepeatingPages(t *testing.T) {
 	for _, body := range []string{`{}`, `{"data":null}`, `{"data":[]}`, `{"data":[],"pagination":{"hasMore":true}}`, `{"data":[],"pagination":{"hasMore":true,"cursor":"repeat"}}`} {
 		t.Run(body, func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, body) }))
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, body)
+			}))
 			defer s.Close()
-			c := &apiClient{baseURL: s.URL, rootKey: "test", http: newHTTPClient()}
+			c := newAPIClient(s.URL, "test")
 			if _, err := c.listKeys(context.Background(), "api_demo", false); err == nil {
 				t.Fatal("accepted incomplete listing")
 			}
@@ -65,6 +71,7 @@ func TestAnalyticsUsesMillisecondsAndDemoFilters(t *testing.T) {
 		t.Run(strconv.Itoa(events), func(t *testing.T) {
 			requests := 0
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
 				requests++
 				var q struct {
 					Query string `json:"query"`
@@ -89,7 +96,7 @@ func TestAnalyticsUsesMillisecondsAndDemoFilters(t *testing.T) {
 				_, _ = fmt.Fprintf(w, `{"data":[{"events":%d}]}`, events)
 			}))
 			defer s.Close()
-			c := &apiClient{baseURL: s.URL, rootKey: "test", http: newHTTPClient()}
+			c := newAPIClient(s.URL, "test")
 			err := checkAnalytics(context.Background(), c)
 			if (err == nil) != (events > 0) {
 				t.Fatalf("freshness: %v", err)
@@ -185,5 +192,96 @@ func TestRunScenarioRejectsStatusPolicyConfusion(t *testing.T) {
 		if err == nil {
 			t.Fatalf("accepted HTTP %d", response.status)
 		}
+	}
+}
+
+func TestSDKWriteErrorsAreSafeAndNotRetried(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{500, `{"meta":{"requestId":"req_test"},"error":{"status":500,"detail":"root-secret key-secret","title":"failure","type":"https://example.com/error"}}`},
+		{500, `root-secret key-secret`},
+		{201, `{"data":{"apiId":"root-secret key-secret"}}`},
+	} {
+		t.Run(fmt.Sprint(tc.status, tc.body), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != "/v2/apis.createApi" || r.Header.Get("Authorization") != "Bearer root-secret" {
+					t.Error("incorrect SDK request")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := initAPIs(ctx, newAPIClient(server.URL, "root-secret"), io.Discard)
+			if err == nil || strings.Contains(err.Error(), "root-secret") || strings.Contains(err.Error(), "key-secret") {
+				t.Fatalf("unsafe SDK error: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("write attempted %d times", calls)
+			}
+		})
+	}
+}
+
+func TestSDKVerificationDecisionBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		body           string
+		allowed, valid bool
+	}{
+		{`{"data":{"valid":true,"code":"VALID","keyId":"key_test"}}`, true, true},
+		{`{"data":{"valid":false,"code":"NOT_FOUND"}}`, true, false},
+		{`{"data":{"code":"NOT_FOUND"}}`, false, false},
+		{`{"data":{"valid":null,"code":"NOT_FOUND"}}`, false, false},
+		{`{"data":{"valid":"false","code":"NOT_FOUND"}}`, false, false},
+		{`{"data":{"valid":false,"code":"VALID"}}`, false, false},
+		{`{"data":{"valid":true,"code":"NOT_FOUND"}}`, false, false},
+		{`{"data":{"valid":false,"code":"UNKNOWN"}}`, false, false},
+		{`{"data":null}`, false, false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			v, err := newAPIClient(server.URL, "test").verify(context.Background(), components.V2KeysVerifyKeyRequestBody{Key: "key_test"})
+			if (err == nil) != tc.allowed || v.Valid != tc.valid {
+				t.Fatalf("valid=%t err=%v", v.Valid, err)
+			}
+		})
+	}
+}
+
+func TestSDKQuotaDecisionBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		field string
+		want  string
+	}{
+		{`"success":true`, "allowed"}, {`"success":false`, "exhausted"},
+		{`"remaining":0`, "invalid"}, {`"success":null`, "invalid"}, {`"success":0`, "invalid"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"data":{%s}}`, tc.field)
+			}))
+			t.Cleanup(server.Close)
+			err := takeQuota(context.Background(), newAPIClient(server.URL, "test"), time.Now(), 1)
+			got := "invalid"
+			if err == nil {
+				got = "allowed"
+			} else if errors.Is(err, errBudgetExhausted) {
+				got = "exhausted"
+			}
+			if got != tc.want {
+				t.Fatalf("got %s, want %s: %v", got, tc.want, err)
+			}
+		})
 	}
 }

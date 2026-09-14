@@ -62,7 +62,7 @@ func run(ctx context.Context, args []string) error {
 	if (mode == "serve" || mode == "worker") && len(token) < 32 {
 		return errors.New("SHOP_WORKER_TOKEN must contain at least 32 characters")
 	}
-	c := &apiClient{baseURL: baseURL, rootKey: rootKey, http: newHTTPClient()}
+	c := newAPIClient(baseURL, rootKey)
 	switch mode {
 	case "init":
 		return initAPIs(ctx, c, os.Stdout)

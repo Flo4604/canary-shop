@@ -52,7 +52,7 @@ func newFakeUnkey(t *testing.T) *fakeUnkey {
 
 func (f *fakeUnkey) client(t *testing.T) *apiClient {
 	t.Helper()
-	return &apiClient{baseURL: f.server.URL, rootKey: testRoot, http: newHTTPClient()}
+	return newAPIClient(f.server.URL, testRoot)
 }
 
 func decodeObject(t *testing.T, r *http.Request) (map[string]any, error) {
@@ -71,6 +71,15 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
+
+func writeAPIError(w http.ResponseWriter, status int) {
+	writeJSON(w, status, map[string]any{"meta": map[string]string{"requestId": "req_test"}, "error": map[string]any{"status": status, "title": http.StatusText(status), "detail": "test failure", "type": "https://unkey.com/docs/errors/test"}})
+}
+
+func writeAPIData(w http.ResponseWriter, data any) {
+	writeJSON(w, 200, map[string]any{"meta": map[string]string{"requestId": "req_test"}, "data": data})
+}
+
 func requiredString(body map[string]any, name string) (string, bool) {
 	v, ok := body[name].(string)
 	return v, ok && v != ""
@@ -96,37 +105,44 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	body["_operation"] = op
 	f.requests = append(f.requests, body)
 	if f.forceStatus != 0 {
-		writeJSON(w, f.forceStatus, map[string]any{"error": "forced"})
+		writeAPIError(w, f.forceStatus)
 		return
 	}
 	switch op {
 	case "permissions.getRole":
 		if f.writes["permissions.createRole"] == 0 {
-			http.Error(w, "missing", 404)
+			writeAPIError(w, 404)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"name": lifecycleRole, "permissions": []map[string]string{{"slug": "catalog.read"}}}})
+		writeAPIData(w, map[string]any{"id": "role_catalog", "name": lifecycleRole, "permissions": []map[string]string{{"id": "perm_catalog", "name": "catalog.read", "slug": "catalog.read"}}})
 	case "permissions.createRole":
 		f.writes[op]++
-		writeJSON(w, 200, map[string]any{"data": map[string]string{"roleId": "role_catalog"}})
+		writeAPIData(w, map[string]string{"roleId": "role_catalog"})
 	case "keys.addRoles", "keys.addPermissions", "keys.updateCredits":
 		id, _ := requiredString(body, "keyId")
+		var data any
 		for _, k := range f.keys {
 			if k.id != id {
 				continue
 			}
 			if op == "keys.updateCredits" {
 				*k.credits += int(body["value"].(float64))
+				data = map[string]int{"remaining": *k.credits}
 			} else {
 				k.permissions = append(k.permissions, "catalog.read")
+				if op == "keys.addRoles" {
+					data = []map[string]string{{"id": "role_catalog", "name": lifecycleRole}}
+				} else {
+					data = []map[string]string{{"id": "perm_catalog", "name": "catalog.read", "slug": "catalog.read"}}
+				}
 			}
 		}
 		f.writes[op]++
-		writeJSON(w, 200, map[string]any{"data": struct{}{}})
+		writeAPIData(w, data)
 	case "identities.deleteIdentity":
 		id, _ := requiredString(body, "identity")
 		delete(f.identities, id)
-		writeJSON(w, 200, map[string]any{"data": struct{}{}})
+		writeJSON(w, 200, map[string]any{"meta": map[string]string{"requestId": "req_delete_identity"}})
 	case "apis.createApi":
 		name, ok := requiredString(body, "name")
 		if !ok {
@@ -137,15 +153,15 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		id := fmt.Sprintf("api_%d", f.nextAPI)
 		f.apis[id] = name
 		f.writes[op]++
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"apiId": id}})
+		writeAPIData(w, map[string]any{"apiId": id})
 	case "identities.getIdentity":
 		id, _ := requiredString(body, "identity")
 		meta, ok := f.identities[id]
 		if !ok {
-			writeJSON(w, 404, map[string]any{"error": "not found"})
+			writeAPIError(w, 404)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"externalId": id, "meta": meta}})
+		writeAPIData(w, map[string]any{"id": "id_" + id, "externalId": id, "meta": meta})
 	case "identities.createIdentity":
 		id, ok := requiredString(body, "externalId")
 		meta, _ := body["meta"].(map[string]any)
@@ -155,7 +171,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.identities[id] = mapToMeta(meta)
 		f.writes[op]++
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"identityId": "id_" + id}})
+		writeAPIData(w, map[string]any{"identityId": "id_" + id})
 	case "apis.listKeys":
 		apiID, _ := requiredString(body, "apiId")
 		if body["decrypt"] != false {
@@ -182,7 +198,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if end < len(all) {
 			pagination["cursor"] = fmt.Sprintf("cursor-%d", end)
 		}
-		writeJSON(w, 200, map[string]any{"data": data, "pagination": pagination})
+		writeJSON(w, 200, map[string]any{"meta": map[string]string{"requestId": "req_list"}, "data": data, "pagination": pagination})
 	case "keys.deleteKey":
 		id, _ := requiredString(body, "keyId")
 		if body["permanent"] != false {
@@ -193,7 +209,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if k.id == id {
 				k.deleted = true
 				f.writes[op]++
-				writeJSON(w, 200, map[string]any{"data": map[string]any{"keyId": id}})
+				writeAPIData(w, struct{}{})
 				return
 			}
 		}
@@ -201,7 +217,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "keys.createKey":
 		f.writes[op]++
 		if f.failCreateAt > 0 && f.writes[op] == f.failCreateAt {
-			writeJSON(w, 500, map[string]any{"error": "failed"})
+			writeAPIError(w, 500)
 			return
 		}
 		apiID, _ := requiredString(body, "apiId")
@@ -222,7 +238,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			k.credits = &n
 		}
 		f.keys[plain] = k
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"keyId": id, "key": plain}})
+		writeAPIData(w, map[string]any{"keyId": id, "key": plain})
 	case "keys.verifyKey":
 		key, _ := requiredString(body, "key")
 		permission, _ := requiredString(body, "permissions")
@@ -260,7 +276,7 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			data = map[string]any{"valid": code == "VALID", "code": code, "keyId": k.id, "meta": k.meta}
 		}
-		writeJSON(w, 200, map[string]any{"data": data})
+		writeAPIData(w, data)
 	case "ratelimit.limit":
 		ns, _ := requiredString(body, "namespace")
 		id, _ := requiredString(body, "identifier")
@@ -283,10 +299,10 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"success": success}})
+		writeAPIData(w, map[string]any{"success": success, "limit": body["limit"], "remaining": 0, "reset": time.Now().Add(time.Minute).UnixMilli()})
 	case "ratelimit.setOverride":
 		f.writes[op]++
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"overrideId": "ov"}})
+		writeAPIData(w, map[string]any{"overrideId": "ov"})
 	default:
 		http.Error(w, "unsupported", 404)
 	}
