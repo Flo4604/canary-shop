@@ -183,7 +183,7 @@ type createKey struct {
 	APIID       string   `json:"apiId"`
 	Name        string   `json:"name"`
 	Prefix      string   `json:"prefix"`
-	ExternalID  string   `json:"externalId"`
+	ExternalID  string   `json:"externalId,omitempty"`
 	Meta        keyMeta  `json:"meta"`
 	Enabled     bool     `json:"enabled"`
 	Recoverable bool     `json:"recoverable"`

@@ -100,6 +100,33 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch op {
+	case "permissions.getRole":
+		if f.writes["permissions.createRole"] == 0 {
+			http.Error(w, "missing", 404)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"data": map[string]any{"name": lifecycleRole, "permissions": []map[string]string{{"slug": "catalog.read"}}}})
+	case "permissions.createRole":
+		f.writes[op]++
+		writeJSON(w, 200, map[string]any{"data": map[string]string{"roleId": "role_catalog"}})
+	case "keys.addRoles", "keys.addPermissions", "keys.updateCredits":
+		id, _ := requiredString(body, "keyId")
+		for _, k := range f.keys {
+			if k.id != id {
+				continue
+			}
+			if op == "keys.updateCredits" {
+				*k.credits += int(body["value"].(float64))
+			} else {
+				k.permissions = append(k.permissions, "catalog.read")
+			}
+		}
+		f.writes[op]++
+		writeJSON(w, 200, map[string]any{"data": struct{}{}})
+	case "identities.deleteIdentity":
+		id, _ := requiredString(body, "identity")
+		delete(f.identities, id)
+		writeJSON(w, 200, map[string]any{"data": struct{}{}})
 	case "apis.createApi":
 		name, ok := requiredString(body, "name")
 		if !ok {
@@ -121,8 +148,8 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"data": map[string]any{"externalId": id, "meta": meta}})
 	case "identities.createIdentity":
 		id, ok := requiredString(body, "externalId")
-		meta, metaOK := body["meta"].(map[string]any)
-		if !ok || !metaOK {
+		meta, _ := body["meta"].(map[string]any)
+		if !ok {
 			http.Error(w, "identity", 400)
 			return
 		}
@@ -203,14 +230,33 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		data := map[string]any{"valid": false, "code": "NOT_FOUND"}
 		if k := f.keys[key]; k != nil && !k.deleted {
 			code := "VALID"
+			cost := 1
+			if credits, ok := body["credits"].(map[string]any); ok {
+				cost = int(credits["cost"].(float64))
+			}
 			if !k.enabled {
 				code = "DISABLED"
 			} else if k.expires > 0 && k.expires < time.Now().UnixMilli() {
 				code = "EXPIRED"
-			} else if k.credits != nil && *k.credits == 0 {
+			} else if k.credits != nil && *k.credits < cost {
 				code = "USAGE_EXCEEDED"
-			} else if !contains(k.permissions, permission) {
+			} else if permission != "" && !contains(k.permissions, permission) {
 				code = "INSUFFICIENT_PERMISSIONS"
+			}
+			if code == "VALID" && k.credits != nil {
+				*k.credits -= cost
+			}
+			if code == "VALID" && strings.HasPrefix(k.externalID, "canary-shop-lifecycle-") {
+				limits, _ := body["ratelimits"].([]any)
+				for _, raw := range limits {
+					limit := raw.(map[string]any)
+					cost := int(limit["cost"].(float64))
+					if f.quota[k.externalID]+cost > 2 {
+						code = "RATE_LIMITED"
+					} else {
+						f.quota[k.externalID] += cost
+					}
+				}
 			}
 			data = map[string]any{"valid": code == "VALID", "code": code, "keyId": k.id, "meta": k.meta}
 		}
@@ -224,6 +270,10 @@ func (f *fakeUnkey) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		success := !f.denyLimit
+		if ns != budgetNamespace {
+			f.quota[ns+":"+id] += int(body["cost"].(float64))
+			success = success && f.quota[ns+":"+id] <= int(body["limit"].(float64))
+		}
 		if ns == budgetNamespace {
 			cost := int(body["cost"].(float64))
 			f.quota[id] += cost
@@ -496,7 +546,7 @@ func TestIntegrationShopScenarios(t *testing.T) {
 		}
 	}
 	f.denyLimit = true
-	if err := runScenario(context.Background(), newHTTPClient(), shop.URL, token, scenario{"normal", "/products", "GET", "OK", true}, "plain_normal", 99); err != nil {
+	if err := runScenario(context.Background(), newHTTPClient(), shop.URL, token, scenario{"normal", "/products", "GET", "OK", true}, "plain_normal", 99); !errors.Is(err, errBurstThrottled) {
 		t.Fatal(err)
 	}
 }

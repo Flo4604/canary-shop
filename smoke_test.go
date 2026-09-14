@@ -19,12 +19,12 @@ func TestWorkerFullCycle(t *testing.T) {
 	t.Setenv("SHOP_URL", shop.URL)
 	t.Setenv("STOREFRONT_API_ID", "api_storefront")
 	t.Setenv("WAREHOUSE_API_ID", "api_warehouse")
-	ctx, cancel := context.WithTimeout(context.Background(), 65*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := run(ctx, []string{"worker", "--allow-local", "--interval", "100ms", "--count", "100"}); err != nil {
 		t.Fatal(err)
 	}
-	if f.writes["keys.createKey"] != 64 || f.writes["keys.verifyKey"] != 100 || len(f.identities) != 30 {
+	if f.writes["keys.createKey"] != 70 || f.writes["keys.verifyKey"] != 121 || len(f.identities) != 30 {
 		t.Fatalf("created=%d verified=%d identities=%d", f.writes["keys.createKey"], f.writes["keys.verifyKey"], len(f.identities))
 	}
 	seen := map[string]int{}

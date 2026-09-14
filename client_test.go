@@ -101,6 +101,23 @@ func TestAnalyticsUsesMillisecondsAndDemoFilters(t *testing.T) {
 	}
 }
 
+func TestScenarioFailuresAreInterleaved(t *testing.T) {
+	for _, tc := range []struct {
+		sequence int64
+		code     string
+	}{
+		{7, "OK"}, {8, "DISABLED"}, {9, "OK"},
+		{17, "EXPIRED"}, {26, "USAGE_EXCEEDED"},
+		{35, "INSUFFICIENT_PERMISSIONS"}, {44, "NOT_FOUND"},
+		{53, "DISABLED"}, {89, "NOT_FOUND"}, {90, "OK"},
+		{108, "DISABLED"},
+	} {
+		if got := scenarioAt(tc.sequence).Expected; got != tc.code {
+			t.Fatalf("sequence %d: got %s, want %s", tc.sequence, got, tc.code)
+		}
+	}
+}
+
 func TestScenarioPopulationAndBoundaries(t *testing.T) {
 	customers, outcomes := map[string]bool{}, map[string]int{}
 	for n := range int64(11600) {

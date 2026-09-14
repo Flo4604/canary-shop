@@ -19,13 +19,22 @@ type scenario struct {
 	Burst    bool
 }
 
+var errBurstThrottled = errors.New("burst request throttled")
+
+func checkBurst(n int64, throttled bool) error {
+	if n%100 == 99 && !throttled {
+		return errors.New("burst completed without any throttle")
+	}
+	return nil
+}
+
 func scenarioAt(n int64) scenario {
 	cycle := n % 100
 	if cycle >= 90 {
 		return scenario{Fixture: "canary-shop-customer-00-storefront", Path: "/products", Method: "GET", Expected: "OK", Burst: true}
 	}
-	if cycle >= 80 {
-		switch cycle % 5 {
+	if cycle%9 == 8 {
+		switch (cycle / 9) % 5 {
 		case 0:
 			return scenario{"canary-shop-disabled", "/products", "GET", "DISABLED", false}
 		case 1:
@@ -51,7 +60,7 @@ func scenarioAt(n int64) scenario {
 
 func scenarioDelay(s scenario, now time.Time, interval time.Duration) time.Duration {
 	if s.Burst {
-		return interval / 4
+		return min(interval/4, 250*time.Millisecond)
 	}
 	if now.UTC().Hour() < 6 {
 		return interval * 3
@@ -91,7 +100,7 @@ func runScenario(ctx context.Context, h *http.Client, target, token string, s sc
 	}
 	if result.Code == "RATE_LIMITED" && s.Burst && res.StatusCode == 429 {
 		slog.Info("scenario complete", "route", s.Path, "code", result.Code, "expected", true)
-		return nil
+		return errBurstThrottled
 	}
 	if result.Code != s.Expected || res.StatusCode != expectedStatus {
 		return fmt.Errorf("scenario %s: expected %s/HTTP %d, got HTTP %d", s.Fixture, s.Expected, expectedStatus, res.StatusCode)
@@ -131,9 +140,17 @@ func work(ctx context.Context, c *apiClient, apis map[string]string, target, tok
 	consecutiveErrors := 0
 	nextAnalytics := time.Now().Add(5 * time.Minute)
 	nextRenewal := time.Now().Add(12 * time.Hour)
+	nextLifecycle := time.Now()
+	burstThrottled := false
 	var failures int
 	for n := int64(0); count == 0 || n < int64(count); n++ {
-		if time.Now().After(nextRenewal) {
+		if n%100 < 90 && time.Now().After(nextLifecycle) {
+			if err := runLifecycle(ctx, c, apis["storefront"], 2*time.Second); err != nil {
+				return fmt.Errorf("lifecycle failed: %w", err)
+			}
+			nextLifecycle = time.Now().Add(time.Hour)
+		}
+		if n%100 < 90 && time.Now().After(nextRenewal) {
 			fresh, err := createFixtures(ctx, c, apis, time.Now())
 			if err != nil {
 				return err
@@ -151,6 +168,16 @@ func work(ctx context.Context, c *apiClient, apis map[string]string, target, tok
 			key = keys[s.Fixture].Plaintext
 		}
 		err := runScenario(ctx, h, target, token, s, key, time.Now().UnixNano())
+		if n%100 == 90 {
+			burstThrottled = false
+		}
+		if errors.Is(err, errBurstThrottled) {
+			burstThrottled = true
+			err = nil
+		}
+		if err == nil {
+			err = checkBurst(n, burstThrottled)
+		}
 		delay := scenarioDelay(s, time.Now(), interval)
 		if err != nil {
 			if ctx.Err() != nil {

@@ -2,7 +2,8 @@ FROM golang:1.25.10-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY *.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /canary-shop .
+ARG APP_VERSION=development
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=${APP_VERSION}" -o /canary-shop .
 
 FROM alpine:3.23
 RUN apk add --no-cache ca-certificates && \

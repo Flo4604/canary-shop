@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var buildVersion = "development"
+
 type limitRequest struct {
 	Namespace  string `json:"namespace"`
 	Identifier string `json:"identifier"`
@@ -53,6 +55,15 @@ func shopHandler(c *apiClient, token string, dailyLimit int) http.Handler {
 	mux := http.NewServeMux()
 	wantToken := sha256.Sum256([]byte(token))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { reply(w, 200, shopResult{Code: "ALIVE"}) })
+	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := json.NewEncoder(w).Encode(struct {
+			Version string `json:"version"`
+		}{buildVersion}); err != nil {
+			slog.Debug("version response write failed")
+		}
+	})
 	for _, route := range []struct {
 		pattern    string
 		permission string
